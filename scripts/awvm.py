@@ -450,6 +450,33 @@ def up(
     _open_rdp_file_if_possible(rdp)
 
 
+def _destroy_tf_vars(creds: Optional[Credentials], tf_outputs: Optional[dict]) -> list[str]:
+    """Reconstruct the `-var` args required by `terraform destroy`.
+
+    The four variables without defaults — run_id, size, allowed_cidr,
+    admin_password — must be supplied even on destroy or Terraform errors
+    before it can plan the teardown. Prefer local credentials.json; fall
+    back to terraform outputs for the drifted-no-creds case. For
+    admin_password (sensitive, not in outputs), pass a placeholder that
+    satisfies the variable — the value is unused during destroy.
+    """
+    if creds is not None:
+        return [
+            f"-var=run_id={creds.run_id}",
+            f"-var=size={creds.size}",
+            f"-var=allowed_cidr={creds.allowed_cidr}",
+            f"-var=admin_password={creds.password}",
+        ]
+    outputs = tf_outputs or {}
+    return [
+        f"-var=run_id={outputs.get('run_id', 'drft')}",
+        f"-var=size={outputs.get('size', 'small')}",
+        f"-var=allowed_cidr={outputs.get('allowed_cidr', '0.0.0.0/32')}",
+        # Password is sensitive and not exported; placeholder is fine on destroy.
+        "-var=admin_password=Placeholder!ForDestroy0",
+    ]
+
+
 @app.command()
 def down(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation."),
@@ -478,9 +505,10 @@ def down(
 
     _run(["terraform", "init", "-input=false"], cwd=TF_DIR, check=True)
 
+    tf_vars = _destroy_tf_vars(creds, tf_outputs)
     try:
         _run(
-            ["terraform", "destroy", "-auto-approve", "-input=false"],
+            ["terraform", "destroy", "-auto-approve", "-input=false", *tf_vars],
             cwd=TF_DIR,
             check=True,
         )
