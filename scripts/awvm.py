@@ -296,20 +296,38 @@ def _write_rdp_file(creds: Credentials) -> Path:
     return RDP_FILE
 
 
+# Microsoft's RDP client for macOS, preferred → legacy.
+# In 2024 Microsoft replaced "Microsoft Remote Desktop" with the rebranded
+# "Windows App" (same App Store ID), but kept the .app bundle co-installable.
+RDP_APP_CANDIDATES = (
+    "/Applications/Windows App.app",
+    "/Applications/Microsoft Remote Desktop.app",
+)
+
+
+def _find_rdp_app() -> Optional[str]:
+    for path in RDP_APP_CANDIDATES:
+        if Path(path).exists():
+            return path
+    return None
+
+
 def _open_rdp_file_if_possible(rdp: Path) -> None:
-    rd_app = Path("/Applications/Microsoft Remote Desktop.app")
-    if not rd_app.exists():
+    app_path = _find_rdp_app()
+    if app_path is None:
         console.print(
-            "[yellow]Microsoft Remote Desktop not found.[/yellow] "
+            "[yellow]Windows App / Microsoft Remote Desktop not found.[/yellow] "
             f"RDP file saved at {rdp}"
         )
         console.print(
-            "  Install from the Mac App Store: "
-            "https://apps.apple.com/app/microsoft-remote-desktop/id1295203466"
+            "  Install Windows App (formerly Microsoft Remote Desktop) from the Mac App Store: "
+            "https://apps.apple.com/app/windows-app/id1295203466"
         )
         return
     try:
-        _run(["open", str(rdp)], check=True)
+        # Route the .rdp file through the specific app rather than relying on
+        # the system default — avoids surprises if both apps are installed.
+        _run(["open", "-a", app_path, str(rdp)], check=True)
     except subprocess.CalledProcessError as e:
         console.print(f"[yellow]Could not auto-open RDP file:[/yellow] {e}")
         console.print(f"  File: {rdp}")
@@ -325,7 +343,7 @@ def up(
     region: str = typer.Option("eastus2", "--region", "-r"),
     image_publisher: str = typer.Option("MicrosoftWindowsDesktop", "--image-publisher"),
     image_offer: str = typer.Option("windows-11", "--image-offer"),
-    image_sku: str = typer.Option("win11-23h2-pro", "--image-sku"),
+    image_sku: str = typer.Option("win11-25h2-pro", "--image-sku"),
     shutdown_timezone: str = typer.Option(
         "Eastern Standard Time", "--shutdown-timezone",
         help="Windows-style timezone, e.g. 'Eastern Standard Time'.",

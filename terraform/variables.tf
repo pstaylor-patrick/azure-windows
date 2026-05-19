@@ -73,7 +73,7 @@ variable "image_offer" {
 variable "image_sku" {
   description = "Marketplace image SKU. Pinned but overridable; preflight validates it resolves in the region."
   type        = string
-  default     = "win11-23h2-pro"
+  default     = "win11-25h2-pro"
 }
 
 variable "image_version" {

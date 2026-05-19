@@ -26,8 +26,29 @@ Cost numbers are planning estimates, not billing truth.
 
 ```bash
 brew install azure-cli terraform uv
-# Install Microsoft Remote Desktop from the Mac App Store
+# Install Windows App (formerly Microsoft Remote Desktop) from the Mac App Store:
+# https://apps.apple.com/app/windows-app/id1295203466
 az login
+
+# Install Claude Code skills (/awvm, /awvm-up, etc.)
+./install.sh
+```
+
+Uninstall the skills any time with `./install.sh --uninstall`. The script
+symlinks files from `skills/` into `~/.claude/commands/`, so edits to the
+source files take effect immediately.
+
+### Optional: zsh aliases
+
+```bash
+awvm() {
+  ( cd ~/workspaces/growth/repos/azure-windows && uv run scripts/awvm.py "$@" )
+}
+alias wup='awvm up --size small'
+alias wdown='awvm down --yes'
+alias wstatus='awvm status'
+alias wconnect='awvm connect'
+alias wrefresh='awvm allow-ip-refresh'
 ```
 
 Confirm you're on the right subscription:
