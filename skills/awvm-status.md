@@ -27,6 +27,6 @@ Or use the zsh alias: `wstatus`.
 Surface the CLI's recovery hints verbatim and point the user at `docs/RECOVERY.md`. Drift typically means one of:
 
 - Local metadata was wiped but Azure resources still exist → use `az group delete` then `awvm down --force-clean-local`.
-- tfstate exists but local metadata doesn't → resume with `cd terraform && terraform destroy -auto-approve` (passing the same `-var` values as the original apply).
+- tfstate exists but local metadata doesn't → run `awvm down --yes`; the CLI rebuilds the required `-var` values from terraform outputs.
 
 Do not assume "drifted" is safe to ignore — there may be Azure resources silently accruing cost.

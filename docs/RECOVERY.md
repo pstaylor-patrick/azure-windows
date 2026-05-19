@@ -35,9 +35,9 @@ Procedures for when `up` or `down` half-fails. The CLI is designed to fail loud 
    ```bash
    az resource list --resource-group <rg_name> -o table
    ```
-2. Retry the destroy:
+2. Retry the destroy — the CLI reconstructs the required `-var` values from `.azure-windows/credentials.json`:
    ```bash
-   cd terraform && terraform destroy -auto-approve
+   uv run scripts/awvm.py down --yes
    ```
 3. If destroy keeps failing on a stuck resource, nuke the RG:
    ```bash
@@ -67,16 +67,22 @@ uv run scripts/awvm.py down --yes --force-clean-local
 
 ### b. tfstate exists, local metadata does not
 
-You can still destroy via plain Terraform:
+The CLI handles this case — it falls back to reading `run_id`, `size`, and `allowed_cidr` from terraform outputs and passes a placeholder for `admin_password` (which is sensitive, not exported, and unused during destroy):
 
 ```bash
-cd terraform && terraform destroy -auto-approve
+uv run scripts/awvm.py down --yes
 ```
 
-You will need to provide the same `-var` values used during apply (run_id, size, region, allowed_cidr, admin_username, admin_password) since Terraform requires them. Look them up in:
+If you'd rather invoke Terraform directly, supply the required vars yourself:
 
-- `terraform.tfstate` (outputs section has run_id, region, etc.)
-- Azure portal for the password? You can't recover it — generate a new one and pass any value; destroy doesn't care if the password is valid, only that the variable is supplied.
+```bash
+cd terraform
+terraform destroy -auto-approve \
+  -var=run_id=$(terraform output -raw run_id) \
+  -var=size=$(terraform output -raw size) \
+  -var=allowed_cidr=$(terraform output -raw allowed_cidr) \
+  -var=admin_password=Placeholder!ForDestroy0
+```
 
 ## 4. Home IP changed and RDP stopped working
 
