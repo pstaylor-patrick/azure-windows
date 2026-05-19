@@ -1,0 +1,36 @@
+# Local runtime state — credentials, run pointers, generated RDP files
+.azure-windows/
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.tfstate.lock.info
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/crash.log
+terraform/crash.*.log
+terraform/*.tfvars
+terraform/*.tfvars.json
+terraform/override.tf
+terraform/override.tf.json
+terraform/*_override.tf
+terraform/*_override.tf.json
+terraform/.terraformrc
+terraform/terraform.rc
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.python-version
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+uv.lock
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
