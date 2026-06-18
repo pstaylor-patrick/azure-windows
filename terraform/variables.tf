@@ -81,3 +81,10 @@ variable "image_version" {
   type        = string
   default     = "latest"
 }
+
+variable "tailscale_auth_key" {
+  description = "Tailscale auth key for automatic tailnet join. Leave empty to skip Tailscale install."
+  type        = string
+  default     = ""
+  sensitive   = true
+}

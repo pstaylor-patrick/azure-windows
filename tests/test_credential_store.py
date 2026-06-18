@@ -36,18 +36,64 @@ def test_store_load_delete(awvm, fake_keyring):
     assert awvm._load_password("run1") is None
 
 
+CRED_FIELDS = dict(
+    run_id="abcd",
+    region="eastus2",
+    rg_name="rg",
+    vm_name="vm",
+    nsg_name="nsg",
+    public_ip="1.2.3.4",
+    username="azureuser",
+    password="secret",
+    allowed_cidr="1.2.3.4/32",
+    created_at="2024-01-01T00:00:00",
+    size="Standard_D2s_v3",
+)
+
+
 def test_credentials_to_dict_no_password(awvm):
-    creds = awvm.Credentials(
-        run_id="abcd",
-        region="eastus2",
-        rg_name="rg",
-        vm_name="vm",
-        nsg_name="nsg",
-        public_ip="1.2.3.4",
-        username="azureuser",
-        password="secret",
-        allowed_cidr="1.2.3.4/32",
-        created_at="2024-01-01T00:00:00",
-        size="Standard_D2s_v3",
-    )
-    assert "password" not in creds.to_dict()
+    creds = awvm.Credentials(**CRED_FIELDS)
+    d = creds.to_dict()
+    assert "password" not in d
+    # all other fields survive the round-trip
+    for key, val in CRED_FIELDS.items():
+        if key != "password":
+            assert d[key] == val, f"field {key!r} missing or wrong in to_dict()"
+
+
+def test_read_credentials_migration_shim(awvm, tmp_state, fake_keyring):
+    """Old-format credentials.json (password in JSON) is migrated to Keychain on read."""
+    import json
+
+    old_data = {**CRED_FIELDS}  # includes password
+    (tmp_state / "credentials.json").write_text(json.dumps(old_data))
+
+    creds = awvm._read_credentials()
+
+    # Password is returned on the object
+    assert creds is not None
+    assert creds.password == "secret"
+
+    # Password is now in the fake Keychain
+    assert fake_keyring[("awvm", "abcd")] == "secret"
+
+    # credentials.json no longer contains the password
+    on_disk = json.loads((tmp_state / "credentials.json").read_text())
+    assert "password" not in on_disk
+
+
+def test_read_credentials_new_format(awvm, tmp_state, fake_keyring):
+    """New-format credentials.json (no password field) hydrates from Keychain."""
+    import json
+
+    new_data = {k: v for k, v in CRED_FIELDS.items() if k != "password"}
+    (tmp_state / "credentials.json").write_text(json.dumps(new_data))
+    fake_keyring[("awvm", "abcd")] = "secret"
+
+    creds = awvm._read_credentials()
+
+    assert creds is not None
+    assert creds.password == "secret"
+    # File should be unchanged (no rewrite triggered)
+    on_disk = json.loads((tmp_state / "credentials.json").read_text())
+    assert "password" not in on_disk

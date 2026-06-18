@@ -11,6 +11,8 @@ Usage:
     uv run scripts/awvm.py ip
     uv run scripts/awvm.py rdp
     uv run scripts/awvm.py allow-ip-refresh
+    uv run scripts/awvm.py reaper
+    uv run scripts/awvm.py smoke-test
 """
 
 from __future__ import annotations
@@ -43,6 +45,26 @@ RDP_FILE = STATE_DIR / "connect.rdp"
 
 TFSTATE_LOCAL = TF_DIR / "terraform.tfstate"
 REMOTE_BACKEND = bool(os.environ.get("AWVM_TFSTATE_ACCOUNT"))
+
+_TS_OP_ITEM = "fax5xj6qyy7oez3juwf2oki45a"
+
+
+def _load_tailscale_key_from_op() -> str:
+    try:
+        r = subprocess.run(
+            ["op", "item", "get", _TS_OP_ITEM, "--fields", "password", "--reveal"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return ""
+
+
+AWVM_TAILSCALE_KEY: str = os.environ.get("AWVM_TAILSCALE_KEY") or _load_tailscale_key_from_op()
 
 # Rough hourly cost estimates for status display. Planning numbers only.
 # Source: Azure public list price for Windows VMs in eastus2 as of 2026-05.
@@ -93,6 +115,7 @@ class Credentials:
     password: str
     allowed_cidr: str
     created_at: str
+    tailscale_ip: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = self.__dict__.copy()
@@ -101,7 +124,9 @@ class Credentials:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Credentials":
-        data = {**data, "password": data.get("password", "")}
+        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        data = {k: v for k, v in data.items() if k in known}
+        data.setdefault("password", "")
         return cls(**data)
 
 
@@ -408,6 +433,108 @@ def _open_rdp_file_if_possible(rdp: Path) -> None:
         console.print(f"  File: {rdp}")
 
 
+def _wait_for_tailscale(run_id: str, timeout: int = 300, interval: int = 10) -> Optional[str]:
+    """Poll tailscale status until awvm-<run_id> appears. Returns Tailscale IP or None."""
+    import time as _time
+
+    hostname = f"awvm-{run_id}"
+    console.print(
+        f"Waiting for [bold]{hostname}[/bold] to appear in Tailscale (up to {timeout}s)..."
+    )
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        try:
+            r = subprocess.run(
+                ["tailscale", "status", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if r.returncode == 0:
+                data = json.loads(r.stdout)
+                for peer in data.get("Peer", {}).values():
+                    if peer.get("HostName", "").lower() == hostname.lower():
+                        addrs = peer.get("TailscaleIPs", [])
+                        if addrs:
+                            console.print(f"[green]Tailscale IP:[/green] {addrs[0]}")
+                            return addrs[0]
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+            pass
+        _time.sleep(interval)
+    console.print(
+        f"[yellow]Tailscale join timed out after {timeout}s. Using public IP for RDP.[/yellow]"
+    )
+    return None
+
+
+def _check_cpu_idle(creds: Credentials, idle_threshold_pct: float = 5.0, windows: int = 4) -> bool:
+    """Return True if VM CPU has been below threshold for `windows` consecutive 15-min periods (1h)."""
+    end = dt.datetime.now(dt.timezone.utc)
+    start = end - dt.timedelta(minutes=windows * 15 + 5)
+    try:
+        sub = subprocess.run(
+            ["az", "account", "show", "--query", "id", "-o", "tsv"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if sub.returncode != 0:
+            return False
+        sub_id = sub.stdout.strip()
+        vm_id = (
+            f"/subscriptions/{sub_id}/resourceGroups/{creds.rg_name}"
+            f"/providers/Microsoft.Compute/virtualMachines/{creds.vm_name}"
+        )
+        r = subprocess.run(
+            [
+                "az",
+                "monitor",
+                "metrics",
+                "list",
+                "--resource",
+                vm_id,
+                "--metric",
+                "Percentage CPU",
+                "--interval",
+                "PT15M",
+                "--start-time",
+                start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "--end-time",
+                end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "--output",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if r.returncode != 0:
+            return False
+        data = json.loads(r.stdout)
+        timeseries = data.get("value", [{}])[0].get("timeseries", [{}])[0].get("data", [])
+        values = [p["average"] for p in timeseries if p.get("average") is not None]
+        return len(values) >= windows and all(v < idle_threshold_pct for v in values[-windows:])
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, IndexError, KeyError):
+        return False
+
+
+def _reaper_destroy(creds: Credentials) -> None:
+    """Destroy the VM non-interactively (used by reaper)."""
+    _preflight_tools()
+    _preflight_azure()
+    _run(_terraform_init_args(), cwd=TF_DIR, check=True)
+    tf_var_args = _destroy_tf_var_args(_destroy_tf_vars(creds, None))
+    _run(
+        ["terraform", "destroy", "-auto-approve", "-input=false", *tf_var_args],
+        cwd=TF_DIR,
+        check=True,
+    )
+    run_id = creds.run_id
+    for p in (CRED_FILE, RUN_POINTER, RDP_FILE):
+        p.unlink(missing_ok=True)
+    _delete_password(run_id)
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -476,6 +603,8 @@ def up(
         f"-var=image_sku={image_sku}",
         f"-var=shutdown_timezone={shutdown_timezone}",
     ]
+    if AWVM_TAILSCALE_KEY:
+        tf_vars.append(f"-var=tailscale_auth_key={AWVM_TAILSCALE_KEY}")
     _run(
         ["terraform", "apply", "-auto-approve", "-input=false", *tf_vars],
         cwd=TF_DIR,
@@ -526,6 +655,12 @@ def up(
         raise typer.Exit(9)
 
     rdp = _write_rdp_file(creds.public_ip, creds.username)
+    if AWVM_TAILSCALE_KEY:
+        ts_ip = _wait_for_tailscale(run_id)
+        if ts_ip:
+            creds.tailscale_ip = ts_ip
+            _atomic_write_json(CRED_FILE, creds.to_dict())
+            rdp = _write_rdp_file(ts_ip, creds.username)
     _print_connect_info(creds)
     _open_rdp_file_if_possible(rdp)
 
@@ -687,7 +822,7 @@ def connect():
     if creds is None:
         console.print("[red]No local credentials found.[/red] Run [bold]awvm up[/bold] first.")
         raise typer.Exit(11)
-    rdp = _write_rdp_file(creds.public_ip, creds.username)
+    rdp = _write_rdp_file(creds.tailscale_ip or creds.public_ip, creds.username)
     _print_connect_info(creds)
     _open_rdp_file_if_possible(rdp)
 
@@ -708,7 +843,7 @@ def rdp():
     if creds is None:
         console.print("[red]No local credentials found.[/red] Run [bold]awvm up[/bold] first.")
         raise typer.Exit(11)
-    path = _write_rdp_file(creds.public_ip, creds.username)
+    path = _write_rdp_file(creds.tailscale_ip or creds.public_ip, creds.username)
     _open_rdp_file_if_possible(path)
     console.print(f"RDP file: {path}")
 
@@ -765,6 +900,8 @@ def allow_ip_refresh():
 def _print_connect_info(creds: Credentials) -> None:
     table = Table(title=f"Windows VM {creds.run_id} is ready", show_header=False, box=None)
     table.add_row("Public IP", creds.public_ip)
+    if creds.tailscale_ip:
+        table.add_row("Tailscale IP", creds.tailscale_ip)
     table.add_row("Username", creds.username)
     if creds.password:
         table.add_row("Password", creds.password)
@@ -777,6 +914,63 @@ def _print_connect_info(creds: Credentials) -> None:
     table.add_row("Size", creds.size)
     console.print(table)
     console.print(f"Credentials saved to: {CRED_FILE}")
+
+
+@app.command()
+def reaper():
+    """Enforce idle/time/weekend policy: destroy the VM if it should not be running."""
+    from zoneinfo import ZoneInfo
+
+    central = ZoneInfo("America/Chicago")
+    now = dt.datetime.now(central)
+
+    creds = _read_credentials()
+    if creds is None:
+        console.print("No VM running.")
+        return
+
+    if now.weekday() >= 5:
+        console.print(f"[yellow]Weekend: destroying {creds.run_id}[/yellow]")
+        _reaper_destroy(creds)
+        return
+
+    if now.hour < 6 or now.hour >= 18:
+        console.print(f"[yellow]Outside operating hours: destroying {creds.run_id}[/yellow]")
+        _reaper_destroy(creds)
+        return
+
+    console.print("Checking CPU idle...")
+    if _check_cpu_idle(creds):
+        console.print(f"[yellow]CPU idle for 1h: destroying {creds.run_id}[/yellow]")
+        _reaper_destroy(creds)
+    else:
+        console.print(f"[green]{creds.run_id} is active -- no action.[/green]")
+
+
+@app.command("smoke-test")
+def smoke_test():
+    """6am health check: verify the VM's RDP port is reachable."""
+    import socket
+    from zoneinfo import ZoneInfo
+
+    central = ZoneInfo("America/Chicago")
+    if dt.datetime.now(central).weekday() >= 5:
+        console.print("Weekend -- skipping smoke test.")
+        return
+
+    creds = _read_credentials()
+    if creds is None:
+        console.print("No VM running -- nothing to test.")
+        return
+
+    target = creds.tailscale_ip or creds.public_ip
+    try:
+        s = socket.create_connection((target, 3389), timeout=15)
+        s.close()
+        console.print(f"[green]Smoke test passed:[/green] {target}:3389 reachable")
+    except OSError as e:
+        console.print(f"[red]Smoke test failed:[/red] {target}:3389 -- {e}")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

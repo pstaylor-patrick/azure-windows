@@ -108,3 +108,23 @@ resource "azurerm_dev_test_global_vm_shutdown_schedule" "main" {
 
   tags = local.common_tags
 }
+
+resource "azurerm_virtual_machine_extension" "tailscale" {
+  count                = var.tailscale_auth_key != "" ? 1 : 0
+  name                 = "tailscale-install"
+  virtual_machine_id   = azurerm_windows_virtual_machine.main.id
+  publisher            = "Microsoft.Compute"
+  type                 = "CustomScriptExtension"
+  type_handler_version = "1.10"
+
+  protected_settings = jsonencode({
+    script = base64encode(templatefile("${path.module}/tailscale.ps1.tftpl", {
+      auth_key = var.tailscale_auth_key
+      hostname = "awvm-${var.run_id}"
+    }))
+  })
+
+  tags = local.common_tags
+
+  depends_on = [azurerm_windows_virtual_machine.main]
+}

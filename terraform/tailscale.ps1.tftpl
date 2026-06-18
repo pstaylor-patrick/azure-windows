@@ -1,0 +1,8 @@
+# Tailscale silent install + tailnet join for ephemeral Azure Windows VMs.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$$ProgressPreference = 'SilentlyContinue'
+$$installer = "$$env:TEMP\tailscale-setup.exe"
+Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.exe' -OutFile $$installer
+Start-Process -FilePath $$installer -ArgumentList '/S' -Wait
+Start-Sleep -Seconds 15
+& 'C:\Program Files\Tailscale\tailscale.exe' up --authkey=${auth_key} --hostname=${hostname} --accept-routes --shields-up=false
