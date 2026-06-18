@@ -118,10 +118,19 @@ resource "azurerm_virtual_machine_extension" "tailscale" {
   type_handler_version = "1.10"
 
   protected_settings = jsonencode({
-    script = base64encode(templatefile("${path.module}/tailscale.ps1.tftpl", {
-      auth_key = var.tailscale_auth_key
-      hostname = "awvm-${var.run_id}"
-    }))
+    commandToExecute = join(" ", [
+      "powershell -ExecutionPolicy Unrestricted -Command",
+      "\"[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;",
+      "$ProgressPreference='SilentlyContinue';",
+      "$msi='C:\\Windows\\Temp\\ts-setup.msi';",
+      "iwr 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi;",
+      "Start-Process msiexec -ArgumentList \\\"/i $msi /quiet /norestart\\\" -Wait;",
+      "Start-Sleep 20;",
+      "& 'C:\\Program Files\\Tailscale\\tailscale.exe' up",
+      "--authkey=${var.tailscale_auth_key}",
+      "--hostname=awvm-${var.run_id}",
+      "--accept-routes --shields-up=false\""
+    ])
   })
 
   tags = local.common_tags
