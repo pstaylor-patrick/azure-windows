@@ -67,12 +67,12 @@ resource "azurerm_network_interface" "main" {
 }
 
 resource "azurerm_windows_virtual_machine" "main" {
-  name                = "${local.name_prefix}-vm"
-  resource_group_name = azurerm_resource_group.main.name
-  location            = azurerm_resource_group.main.location
-  size                = local.vm_size
-  admin_username      = var.admin_username
-  admin_password      = var.admin_password
+  name                  = "${local.name_prefix}-vm"
+  resource_group_name   = azurerm_resource_group.main.name
+  location              = azurerm_resource_group.main.location
+  size                  = local.vm_size
+  admin_username        = var.admin_username
+  admin_password        = var.admin_password
   network_interface_ids = [azurerm_network_interface.main.id]
   tags                  = local.common_tags
 

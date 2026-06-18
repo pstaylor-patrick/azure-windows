@@ -18,6 +18,7 @@ terraform/*_override.tf
 terraform/*_override.tf.json
 terraform/.terraformrc
 terraform/terraform.rc
+terraform/backend.tf
 
 # Python
 .venv/

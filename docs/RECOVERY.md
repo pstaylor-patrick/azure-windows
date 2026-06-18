@@ -106,7 +106,35 @@ Two options:
   uv run scripts/awvm.py up --size <tier>
   ```
 
-## 6. Subscription / quota errors during `up`
+## 6. Password lost or not shown
+
+The VM password is stored in macOS Keychain under:
+
+- **Service**: `awvm`
+- **Account**: the 4-char `run_id` (shown at VM creation and in `awvm status`)
+
+If `awvm connect` shows "Password not found in Keychain", the password was only shown once at creation time and was not successfully saved to Keychain. Options:
+
+- **Reset the password via Azure** (keeps the VM alive):
+  ```bash
+  az vm user update \
+    --resource-group <rg_name> \
+    --name <vm_name> \
+    --username awvmadmin \
+    --password <new_password>
+  ```
+- **Tear down and recreate** (cleanest):
+  ```bash
+  uv run scripts/awvm.py down --yes
+  uv run scripts/awvm.py up --size <tier>
+  ```
+
+You can inspect the Keychain entry directly:
+```bash
+security find-generic-password -s awvm -a <run_id> -w
+```
+
+## 7. Subscription / quota errors during `up`
 
 Preflight should catch most of these. If you hit a "QuotaExceeded" or "SkuNotAvailable" mid-apply anyway:
 

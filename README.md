@@ -105,9 +105,49 @@ docs/RECOVERY.md                  # What to do when apply/destroy half-fails
 - **Local metadata is sufficient to reconnect** — `connect` and `rdp` make no Azure API calls.
 - **All cloud assumptions are validated at runtime.** Region availability, quota, and image resolvability are preflight checks, not hard-coded hopes.
 
+## Remote state (optional)
+
+By default, Terraform state lives locally in `terraform/terraform.tfstate` (gitignored). To share state across machines or back it up, point awvm at an Azure Blob Storage container:
+
+1. Create the storage account once:
+
+   ```bash
+   export AWVM_TFSTATE_ACCOUNT=myuniquestorageacct  # 3-24 lowercase alphanumeric, globally unique
+   ./scripts/bootstrap_backend.sh
+   ```
+
+2. Export the env vars in your shell profile:
+
+   ```bash
+   export AWVM_TFSTATE_ACCOUNT=myuniquestorageacct
+   export AWVM_TFSTATE_RG=awvm-tfstate-rg        # default
+   export AWVM_TFSTATE_CONTAINER=tfstate          # default
+   ```
+
+   Optional overrides: `AWVM_TFSTATE_KEY` (blob key, default `awvm.tfstate`), `AWVM_TFSTATE_LOCATION` (bootstrap only, default `eastus2`).
+
+3. Run `awvm up` as usual. awvm writes `terraform/backend.tf` at runtime (gitignored) and passes `-reconfigure` to `terraform init`.
+
+Authentication uses Azure AD (`use_azuread_auth = true`) — no storage account keys needed as long as you are logged in with `az login` and have the `Storage Blob Data Contributor` role on the container.
+
+## Development
+
+```bash
+# Install dev dependencies (pytest, ruff)
+uv sync --group dev
+
+# Run tests
+uv run pytest
+
+# Lint
+uv run ruff check scripts/ tests/
+
+# Format
+uv run ruff format scripts/ tests/
+```
+
 ## Non-goals (v1)
 
-- Remote tfstate (single user, single laptop)
 - Multi-VM fleets
 - Data disks / persistence across spin-ups
 - `custom_data` provisioning scripts (no auto-installed apps)

@@ -22,11 +22,11 @@ import secrets
 import shutil
 import string
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import keyring
 import requests
 import typer
 from rich.console import Console
@@ -41,6 +41,9 @@ CRED_FILE = STATE_DIR / "credentials.json"
 RUN_POINTER = STATE_DIR / "last_run_id"
 RDP_FILE = STATE_DIR / "connect.rdp"
 
+TFSTATE_LOCAL = TF_DIR / "terraform.tfstate"
+REMOTE_BACKEND = bool(os.environ.get("AWVM_TFSTATE_ACCOUNT"))
+
 # Rough hourly cost estimates for status display. Planning numbers only.
 # Source: Azure public list price for Windows VMs in eastus2 as of 2026-05.
 HOURLY_COST_USD = {
@@ -54,10 +57,28 @@ VALID_SIZES = ("small", "medium", "large")
 app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
 console = Console()
 
+KEYRING_SERVICE = "awvm"
+
+
+def _store_password(run_id: str, password: str) -> None:
+    keyring.set_password(KEYRING_SERVICE, run_id, password)
+
+
+def _load_password(run_id: str) -> Optional[str]:
+    return keyring.get_password(KEYRING_SERVICE, run_id)
+
+
+def _delete_password(run_id: str) -> None:
+    try:
+        keyring.delete_password(KEYRING_SERVICE, run_id)
+    except keyring.errors.PasswordDeleteError:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Metadata model
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Credentials:
@@ -74,16 +95,20 @@ class Credentials:
     created_at: str
 
     def to_dict(self) -> dict:
-        return self.__dict__.copy()
+        d = self.__dict__.copy()
+        d.pop("password", None)
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "Credentials":
+        data = {**data, "password": data.get("password", "")}
         return cls(**data)
 
 
 # ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
+
 
 def _run(
     cmd: list[str],
@@ -153,6 +178,7 @@ def _generate_run_id() -> str:
 # Preflight
 # ---------------------------------------------------------------------------
 
+
 def _preflight_tools() -> None:
     _which_or_die("az", "brew install azure-cli")
     _which_or_die("terraform", "brew install terraform")
@@ -174,11 +200,17 @@ def _preflight_size_in_region(size_sku: str, region: str) -> None:
     try:
         result = _run(
             [
-                "az", "vm", "list-skus",
-                "--location", region,
-                "--size", size_sku,
-                "--query", "[?name=='" + size_sku + "'] | [0]",
-                "-o", "json",
+                "az",
+                "vm",
+                "list-skus",
+                "--location",
+                region,
+                "--size",
+                size_sku,
+                "--query",
+                "[?name=='" + size_sku + "'] | [0]",
+                "-o",
+                "json",
             ],
             capture=True,
             check=True,
@@ -207,14 +239,23 @@ def _preflight_image(region: str, publisher: str, offer: str, sku: str) -> None:
     try:
         result = _run(
             [
-                "az", "vm", "image", "list",
-                "--location", region,
-                "--publisher", publisher,
-                "--offer", offer,
-                "--sku", sku,
+                "az",
+                "vm",
+                "image",
+                "list",
+                "--location",
+                region,
+                "--publisher",
+                publisher,
+                "--offer",
+                offer,
+                "--sku",
+                sku,
                 "--all",
-                "--query", "[0]",
-                "-o", "json",
+                "--query",
+                "[0]",
+                "-o",
+                "json",
             ],
             capture=True,
             check=True,
@@ -224,9 +265,7 @@ def _preflight_image(region: str, publisher: str, offer: str, sku: str) -> None:
         raise typer.Exit(6)
 
     if not result.stdout.strip() or result.stdout.strip() == "null":
-        console.print(
-            f"[red]Image {publisher}/{offer}/{sku} not found in {region}.[/red]"
-        )
+        console.print(f"[red]Image {publisher}/{offer}/{sku} not found in {region}.[/red]")
         console.print(
             "  List available SKUs:\n"
             f"    az vm image list --location {region} --publisher {publisher} "
@@ -239,6 +278,7 @@ def _preflight_image(region: str, publisher: str, offer: str, sku: str) -> None:
 # Local metadata I/O
 # ---------------------------------------------------------------------------
 
+
 def _atomic_write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -250,16 +290,48 @@ def _read_credentials() -> Optional[Credentials]:
     if not CRED_FILE.exists():
         return None
     try:
-        return Credentials.from_dict(json.loads(CRED_FILE.read_text()))
+        data = json.loads(CRED_FILE.read_text())
+        creds = Credentials.from_dict(data)
     except (json.JSONDecodeError, TypeError) as e:
         console.print(f"[yellow]credentials.json is corrupt:[/yellow] {e}")
         return None
+    # Migration: if old format still has password in JSON, move it to Keychain
+    if data.get("password") and not _load_password(creds.run_id):
+        _store_password(creds.run_id, data["password"])
+        _atomic_write_json(CRED_FILE, creds.to_dict())
+    pw = _load_password(creds.run_id)
+    if pw:
+        creds.password = pw
+    return creds
+
+
+def _terraform_init_args() -> list[str]:
+    backend_tf = TF_DIR / "backend.tf"
+    args = ["terraform", "init", "-input=false"]
+    if REMOTE_BACKEND:
+        acct = os.environ["AWVM_TFSTATE_ACCOUNT"]
+        rg = os.environ.get("AWVM_TFSTATE_RG", "awvm-tfstate-rg")
+        container = os.environ.get("AWVM_TFSTATE_CONTAINER", "tfstate")
+        key = os.environ.get("AWVM_TFSTATE_KEY", "awvm.tfstate")
+        backend_tf.write_text(
+            'terraform {\n  backend "azurerm" {\n    use_azuread_auth = true\n  }\n}\n'
+        )
+        args += [
+            "-reconfigure",
+            f"-backend-config=resource_group_name={rg}",
+            f"-backend-config=storage_account_name={acct}",
+            f"-backend-config=container_name={container}",
+            f"-backend-config=key={key}",
+        ]
+    else:
+        if backend_tf.exists():
+            backend_tf.unlink()
+    return args
 
 
 def _terraform_output() -> Optional[dict]:
     """Return parsed terraform outputs, or None if no state / not applied yet."""
-    tfstate = TF_DIR / "terraform.tfstate"
-    if not tfstate.exists():
+    if not REMOTE_BACKEND and not TFSTATE_LOCAL.exists():
         return None
     try:
         result = _run(
@@ -280,17 +352,20 @@ def _terraform_output() -> Optional[dict]:
 # RDP file
 # ---------------------------------------------------------------------------
 
-def _write_rdp_file(creds: Credentials) -> Path:
-    contents = "\r\n".join([
-        f"full address:s:{creds.public_ip}",
-        f"username:s:{creds.username}",
-        "prompt for credentials:i:1",
-        "screen mode id:i:2",
-        "audiomode:i:2",
-        "redirectclipboard:i:1",
-        "redirectprinters:i:0",
-        "drivestoredirect:s:",
-    ])
+
+def _write_rdp_file(public_ip: str, username: str) -> Path:
+    contents = "\r\n".join(
+        [
+            f"full address:s:{public_ip}",
+            f"username:s:{username}",
+            "prompt for credentials:i:1",
+            "screen mode id:i:2",
+            "audiomode:i:2",
+            "redirectclipboard:i:1",
+            "redirectprinters:i:0",
+            "drivestoredirect:s:",
+        ]
+    )
     RDP_FILE.parent.mkdir(parents=True, exist_ok=True)
     RDP_FILE.write_text(contents)
     return RDP_FILE
@@ -337,6 +412,7 @@ def _open_rdp_file_if_possible(rdp: Path) -> None:
 # Commands
 # ---------------------------------------------------------------------------
 
+
 @app.command()
 def up(
     size: str = typer.Option("small", "--size", "-s", help="small | medium | large"),
@@ -345,7 +421,8 @@ def up(
     image_offer: str = typer.Option("windows-11", "--image-offer"),
     image_sku: str = typer.Option("win11-25h2-pro", "--image-sku"),
     shutdown_timezone: str = typer.Option(
-        "Eastern Standard Time", "--shutdown-timezone",
+        "Eastern Standard Time",
+        "--shutdown-timezone",
         help="Windows-style timezone, e.g. 'Eastern Standard Time'.",
     ),
 ):
@@ -380,10 +457,12 @@ def up(
     username = "awvmadmin"
 
     console.print(f"Detected client IP: [bold]{public_ip}[/bold]")
-    console.print(f"Run ID: [bold]{run_id}[/bold]  Size: [bold]{size}[/bold]  Region: [bold]{region}[/bold]")
+    console.print(
+        f"Run ID: [bold]{run_id}[/bold]  Size: [bold]{size}[/bold]  Region: [bold]{region}[/bold]"
+    )
 
     # terraform init (idempotent — safe to run every time).
-    _run(["terraform", "init", "-input=false"], cwd=TF_DIR, check=True)
+    _run(_terraform_init_args(), cwd=TF_DIR, check=True)
 
     tf_vars = [
         f"-var=run_id={run_id}",
@@ -432,6 +511,7 @@ def up(
     try:
         _atomic_write_json(CRED_FILE, creds.to_dict())
         RUN_POINTER.write_text(run_id)
+        _store_password(run_id, password)
     except OSError as e:
         console.print(
             f"[red]Apply succeeded but writing local metadata failed:[/red] {e}\n"
@@ -440,18 +520,18 @@ def up(
             f"    rg:      {creds.rg_name}\n"
             f"    ip:      {creds.public_ip}\n"
             f"    user:    {creds.username}\n"
-            f"    pass:    {creds.password}\n"
+            f"    pass:    {password}\n"
             f"  Then destroy with: cd terraform && terraform destroy -auto-approve {' '.join(tf_vars)}"
         )
         raise typer.Exit(9)
 
-    rdp = _write_rdp_file(creds)
+    rdp = _write_rdp_file(creds.public_ip, creds.username)
     _print_connect_info(creds)
     _open_rdp_file_if_possible(rdp)
 
 
-def _destroy_tf_vars(creds: Optional[Credentials], tf_outputs: Optional[dict]) -> list[str]:
-    """Reconstruct the `-var` args required by `terraform destroy`.
+def _destroy_tf_vars(creds: Optional[Credentials], tf_outputs: Optional[dict]) -> dict:
+    """Reconstruct the var values required by `terraform destroy`.
 
     The four variables without defaults — run_id, size, allowed_cidr,
     admin_password — must be supplied even on destroy or Terraform errors
@@ -459,22 +539,35 @@ def _destroy_tf_vars(creds: Optional[Credentials], tf_outputs: Optional[dict]) -
     back to terraform outputs for the drifted-no-creds case. For
     admin_password (sensitive, not in outputs), pass a placeholder that
     satisfies the variable — the value is unused during destroy.
+
+    Returns a dict mapping internal keys to values.
     """
     if creds is not None:
-        return [
-            f"-var=run_id={creds.run_id}",
-            f"-var=size={creds.size}",
-            f"-var=allowed_cidr={creds.allowed_cidr}",
-            f"-var=admin_password={creds.password}",
-        ]
+        return {
+            "vm_run_id": creds.run_id,
+            "vm_size": creds.size,
+            "vm_allowed_cidr": creds.allowed_cidr,
+            "vm_admin_password": creds.password,
+        }
     outputs = tf_outputs or {}
-    return [
-        f"-var=run_id={outputs.get('run_id', 'drft')}",
-        f"-var=size={outputs.get('size', 'small')}",
-        f"-var=allowed_cidr={outputs.get('allowed_cidr', '0.0.0.0/32')}",
+    return {
+        "vm_run_id": outputs.get("run_id", "drft"),
+        "vm_size": outputs.get("size", "small"),
+        "vm_allowed_cidr": outputs.get("allowed_cidr", "0.0.0.0/32"),
         # Password is sensitive and not exported; placeholder is fine on destroy.
-        "-var=admin_password=Placeholder!ForDestroy0",
-    ]
+        "vm_admin_password": "Placeholder!ForDestroy0",
+    }
+
+
+def _destroy_tf_var_args(tf_vars: dict) -> list[str]:
+    """Convert a _destroy_tf_vars dict to the actual terraform -var flags."""
+    key_map = {
+        "vm_run_id": "run_id",
+        "vm_size": "size",
+        "vm_allowed_cidr": "allowed_cidr",
+        "vm_admin_password": "admin_password",
+    }
+    return [f"-var={key_map.get(k, k)}={v}" for k, v in tf_vars.items()]
 
 
 @app.command()
@@ -503,12 +596,13 @@ def down(
     _preflight_tools()
     _preflight_azure()
 
-    _run(["terraform", "init", "-input=false"], cwd=TF_DIR, check=True)
+    _run(_terraform_init_args(), cwd=TF_DIR, check=True)
 
-    tf_vars = _destroy_tf_vars(creds, tf_outputs)
+    tf_vars_dict = _destroy_tf_vars(creds, tf_outputs)
+    tf_var_args = _destroy_tf_var_args(tf_vars_dict)
     try:
         _run(
-            ["terraform", "destroy", "-auto-approve", "-input=false", *tf_vars],
+            ["terraform", "destroy", "-auto-approve", "-input=false", *tf_var_args],
             cwd=TF_DIR,
             check=True,
         )
@@ -527,9 +621,13 @@ def down(
             raise typer.Exit(10)
         console.print("[yellow]--force-clean-local set: wiping local metadata anyway.[/yellow]")
 
+    # Capture run_id before unlinking files
+    run_id_to_delete = creds.run_id if creds else None
     for p in (CRED_FILE, RUN_POINTER, RDP_FILE):
         if p.exists():
             p.unlink()
+    if run_id_to_delete:
+        _delete_password(run_id_to_delete)
     console.print("[green]Down complete.[/green]")
 
 
@@ -557,9 +655,7 @@ def status():
             "VM may still exist in Azure."
         )
         console.print(json.dumps(creds.to_dict(), indent=2, default=str))
-        console.print(
-            f"  Check the Azure portal for resource group [bold]{creds.rg_name}[/bold]."
-        )
+        console.print(f"  Check the Azure portal for resource group [bold]{creds.rg_name}[/bold].")
         return
 
     # Both present — healthy case.
@@ -591,7 +687,7 @@ def connect():
     if creds is None:
         console.print("[red]No local credentials found.[/red] Run [bold]awvm up[/bold] first.")
         raise typer.Exit(11)
-    rdp = _write_rdp_file(creds)
+    rdp = _write_rdp_file(creds.public_ip, creds.username)
     _print_connect_info(creds)
     _open_rdp_file_if_possible(rdp)
 
@@ -612,7 +708,7 @@ def rdp():
     if creds is None:
         console.print("[red]No local credentials found.[/red] Run [bold]awvm up[/bold] first.")
         raise typer.Exit(11)
-    path = _write_rdp_file(creds)
+    path = _write_rdp_file(creds.public_ip, creds.username)
     _open_rdp_file_if_possible(path)
     console.print(f"RDP file: {path}")
 
@@ -635,16 +731,23 @@ def allow_ip_refresh():
         return
 
     console.print(
-        f"Updating NSG rule: [yellow]{creds.allowed_cidr}[/yellow] → "
-        f"[green]{new_cidr}[/green]"
+        f"Updating NSG rule: [yellow]{creds.allowed_cidr}[/yellow] → [green]{new_cidr}[/green]"
     )
     _run(
         [
-            "az", "network", "nsg", "rule", "update",
-            "--resource-group", creds.rg_name,
-            "--nsg-name", creds.nsg_name,
-            "--name", "AllowRDPFromOperator",
-            "--source-address-prefixes", new_cidr,
+            "az",
+            "network",
+            "nsg",
+            "rule",
+            "update",
+            "--resource-group",
+            creds.rg_name,
+            "--nsg-name",
+            creds.nsg_name,
+            "--name",
+            "AllowRDPFromOperator",
+            "--source-address-prefixes",
+            new_cidr,
         ],
         check=True,
     )
@@ -658,11 +761,18 @@ def allow_ip_refresh():
 # Pretty output helpers
 # ---------------------------------------------------------------------------
 
+
 def _print_connect_info(creds: Credentials) -> None:
     table = Table(title=f"Windows VM {creds.run_id} is ready", show_header=False, box=None)
     table.add_row("Public IP", creds.public_ip)
     table.add_row("Username", creds.username)
-    table.add_row("Password", creds.password)
+    if creds.password:
+        table.add_row("Password", creds.password)
+    else:
+        table.add_row(
+            "Password",
+            "[yellow]Password not found in Keychain. It was only shown at VM creation time.[/yellow]",
+        )
     table.add_row("Region", creds.region)
     table.add_row("Size", creds.size)
     console.print(table)
